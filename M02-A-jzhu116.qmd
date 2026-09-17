@@ -1,37 +1,39 @@
 ---
-title: "Module 2 Assignment: Spark SQL and DataFrames"
-author:
-  - name: Norah Jones
-    affiliations:
-      - id: bu
-        name: Boston University
-        city: Boston
-        state: MA
+title: "Structured Data and SQL Workflows"
+subtitle: "AD688 - Big Data and Cloud Analytics for Business"
+author: "Jiecheng Zhu"
+date: today
+date-modified: today
+date-format: long
 number-sections: true
-date: '2024-11-21'
+jupyter: python3
 format:
   html:
     theme: cerulean
     toc: true
     toc-depth: 2
-date-modified: today
-date-format: long
+  docx:
+    toc: true
+    toc-depth: 2
 execute:
   echo: true
   eval: true
   freeze: auto
 ---
 
+# Submission Information
 
+**GitHub repository:** REPLACE_WITH_YOUR_HTTPS_GITHUB_REPOSITORY_URL
+
+This report uses Apache Spark to transform the MET Employability Career Match job-postings dataset into four related tables. It then uses Spark SQL to examine technology-sector salaries, remote hiring in California, monthly posting trends, and salary differences across selected metropolitan areas. Query results are shown in tables before their required visualizations.
 
 # Submission Validation and Setup
 
-This assignment uses a private API key to create one Excel workbook for your responses. The first run creates a dated workbook in `research_submissions/`. Later runs reuse that same workbook, so you can safely rerun this document without overwriting your work.
+This assignment uses a private API key to create one Excel workbook for the required research survey. The first run creates a dated workbook in `research_submissions/`. Later runs reuse that workbook.
 
-- Update the `.env.example` file in this folder with your Employability API key and rename it to `.env`.
-- Update the `EMPLOYABILITY_API_KEY` value with your Employability API key from the previous step. 
-- Run the following code chunk to verify that your API key is working.
-- Do not run the code chunk below this one until you have updated your API key.
+- Put the Employability API key in `.env`; never paste it into this document.
+- Do not commit `.env`, API keys, screenshots of keys, or generated survey response files unless the instructor explicitly requests them.
+- Use the following structure in `.env`:
 
 ```text
 EMPLOYABILITY_API_KEY=replace_with_your_student_api_key
@@ -40,106 +42,810 @@ EMPLOYABILITY_API_PATH_PREFIX=/met-career-match
 RESEARCH_ASSIGNMENT_CODE=M02_A_emplo
 ```
 
-Do not commit `.env`, API keys, screenshots of keys, or generated response files unless your instructor explicitly asks for them.
-
 ```{python}
 #| label: load-system-code
 #| include: false
-#| eval: true
+#| eval: false
 
 from pathlib import Path
 import sys
 
+# Support either a root-level _system_code folder or analytics/_system_code.
 if not Path("_system_code").exists() and Path("analytics/_system_code").exists():
-    sys.path.insert(0, str(Path("_system_code").resolve()))
+    sys.path.insert(0, str(Path("analytics").resolve()))
 
-from _system_code.research_survey import prepare_workbook, print_runtime_summary, validate_workbook
+from _system_code.research_survey import (
+    prepare_workbook,
+    print_runtime_summary,
+    validate_workbook,
+)
 ```
 
 ## System Check
 
 ```{python}
 #| label: system-check
-#| eval: true
+#| eval: false
 #| echo: false
+
 print_runtime_summary()
 ```
 
-## Create or Reuse Your Excel Workbook
+## Create or Reuse the Research Workbook
 
 ```{python}
-#| eval: true
-#| echo: false
 #| label: create-workbook
-workbook_path = prepare_workbook();
-```
-
-Open the generated workbook inside `research_submissions/` folder, complete the `Survey`, `Assignment`, and `AI Chat` sheets, then save the file.
-
-## Validate Your Filled Workbook
-
-**Turn** `eval: true`after you are done with the assignment. 
-
-```{python}
 #| eval: false
 #| echo: false
+
+workbook_path = prepare_workbook()
+```
+
+Open the generated workbook in `research_submissions/`, complete the `Survey`, `Assignment`, and `AI Chat` sheets, and save it. After the workbook is complete, change `eval: false` to `eval: true` in the validation chunk below.
+
+```{python}
 #| label: validate-workbook
+#| eval: false
+#| echo: false
+
 validate_workbook()
 ```
 
-This validation step checks the Excel workbook locally and creates a local validation report. 
+# Spark Environment and Dataset
 
-# Assignment Responses
+The final submission must use all 17 Parquet partitions. `USE_SAMPLE` can temporarily be changed to `True` during development, but it is set to `False` here for the final analysis.
 
-## Start your assignment here
+```{python}
+#| label: spark-setup
+#| warning: false
+
+import os
+import sys
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import plotly.express as px
+import seaborn as sns
+from IPython.display import Image, Markdown, display
+from matplotlib.ticker import StrMethodFormatter
+from pyspark import StorageLevel
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+
+os.environ["PYSPARK_PYTHON"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
+spark = (
+    SparkSession.builder
+    .appName("JobPostingsAnalysis")
+    .master("local[*]")
+    .config("spark.driver.host", "localhost")
+    .getOrCreate()
+)
+
+spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "false")
+sns.set_theme(style="whitegrid")
+
+# Set to True only while testing. The final submission must use False.
+USE_SAMPLE = False
+
+candidate_data_dirs = [
+    Path("../data/MET_CareerCompass_2026"),
+    Path("data/MET_CareerCompass_2026"),
+]
+
+data_dir = next((path for path in candidate_data_dirs if path.exists()), None)
+if data_dir is None:
+    searched = "\n".join(str(path) for path in candidate_data_dirs)
+    raise FileNotFoundError(
+        "MET_CareerCompass_2026 was not found. Expected one of:\n" + searched
+    )
+
+parquet_files = sorted(data_dir.glob("*.parquet"))
+if not parquet_files:
+    raise FileNotFoundError(f"No Parquet files were found in {data_dir}")
+
+if USE_SAMPLE:
+    parquet_files = parquet_files[:1]
+elif len(parquet_files) != 17:
+    print(
+        f"Warning: the assignment specifies 17 Parquet files, "
+        f"but {len(parquet_files)} were found."
+    )
+
+df = spark.read.parquet(*[str(path.resolve()) for path in parquet_files])
+df = df.toDF(*[column.lower() for column in df.columns])
+
+# Keep only records with a usable posting ID and enforce one row per primary key.
+df = (
+    df.filter(F.col("id").isNotNull() & (F.trim(F.col("id")) != ""))
+    .dropDuplicates(["id"])
+)
+
+print(f"Data directory: {data_dir}")
+print(f"Parquet files loaded: {len(parquet_files)}")
+print(f"Sample mode: {USE_SAMPLE}")
+
+# Development-only previews; leave commented out for the rendered submission.
+# df.printSchema()
+# df.show(5, truncate=False)
+```
+
+The source columns are normalized to lowercase once after loading. The raw dataset remains outside version control.
+
+# Relational Table Design
+
+The model contains three dimension tables and one job-postings fact table. Spark temporary views do not enforce primary-key or foreign-key constraints. Therefore, the workflow creates explicit surrogate keys and then checks key uniqueness and referential integrity.
+
+| Table | Primary key | Foreign keys | Purpose |
+|---|---|---|---|
+| `companies` | `company_id` | None | One row per distinct company record |
+| `industries` | `industry_id` | None | One row per distinct NAICS/SOC occupation combination |
+| `locations` | `location_id` | None | One row per distinct location and MSA combination |
+| `job_postings` | `id` | `company_id`, `industry_id`, `location_id` | One row per job posting |
+
+## Create Dimension Tables
+
+The helper below creates a null-safe natural key from each dimension's source columns. This prevents missing source values from breaking the joins used to add foreign keys to `job_postings`. The assignment-provided `monotonically_increasing_id()` function supplies each surrogate primary key.
+
+```{python}
+#| label: create-dimensions
+#| warning: false
+
+def add_natural_key(frame, source_columns, key_name):
+    """Add a repeatable, null-safe hash key based on source columns."""
+    key_parts = [
+        F.coalesce(F.trim(F.col(name).cast("string")), F.lit("<NULL>"))
+        for name in source_columns
+    ]
+    return frame.withColumn(
+        key_name,
+        F.sha2(F.concat_ws("||", *key_parts), 256),
+    )
 
 
+COMPANY_COLUMNS = [
+    "company",
+    "company_name",
+    "company_raw",
+    "company_is_staffing",
+]
+
+INDUSTRY_COLUMNS = [
+    "naics_2022_6",
+    "naics_2022_6_name",
+    "soc_5",
+    "soc_5_name",
+    "onet_name",
+    "soc_2_name",
+]
+
+LOCATION_COLUMNS = [
+    "location",
+    "city_name",
+    "state_name",
+    "county_name",
+    "msa",
+    "msa_name",
+]
+
+companies_lookup_df = (
+    add_natural_key(
+        df.select(*COMPANY_COLUMNS).distinct(),
+        COMPANY_COLUMNS,
+        "_company_key",
+    )
+    .withColumn("company_id", F.monotonically_increasing_id())
+    .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+# Materializing the lookup keeps generated IDs stable across later SQL actions.
+companies_lookup_df.count()
+
+companies_df = companies_lookup_df.select(
+    "company_id",
+    *COMPANY_COLUMNS,
+)
+
+industries_lookup_df = (
+    add_natural_key(
+        df.select(*INDUSTRY_COLUMNS).distinct(),
+        INDUSTRY_COLUMNS,
+        "_industry_key",
+    )
+    .withColumn("industry_id", F.monotonically_increasing_id())
+    .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+industries_lookup_df.count()
+
+industries_df = industries_lookup_df.select(
+    "industry_id",
+    "naics_2022_6",
+    "naics_2022_6_name",
+    F.col("soc_5").alias("soc_code"),
+    F.col("soc_5_name").alias("soc_name"),
+    F.col("onet_name").alias("specialized_occupation"),
+    F.col("soc_2_name").alias("occupation_group"),
+)
+
+locations_lookup_df = (
+    add_natural_key(
+        df.select(*LOCATION_COLUMNS).distinct(),
+        LOCATION_COLUMNS,
+        "_location_key",
+    )
+    .withColumn("location_id", F.monotonically_increasing_id())
+    .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+locations_lookup_df.count()
+
+locations_df = locations_lookup_df.select(
+    "location_id",
+    *LOCATION_COLUMNS,
+)
+```
+
+## Create the Job Postings Table
+
+The salary-related fields arrive as strings. The helper removes dollar signs and commas and casts only valid numeric strings. Invalid or structured strings become null rather than causing the Spark job to fail.
+
+```{python}
+#| label: create-job-postings
+#| warning: false
+
+def numeric_or_null(column_name):
+    cleaned = F.regexp_replace(
+        F.trim(F.col(column_name).cast("string")),
+        r"[$,]",
+        "",
+    )
+    numeric_pattern = r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$"
+    return F.when(cleaned.rlike(numeric_pattern), cleaned.cast("double"))
 
 
+job_source_df = add_natural_key(df, COMPANY_COLUMNS, "_company_key")
+job_source_df = add_natural_key(job_source_df, INDUSTRY_COLUMNS, "_industry_key")
+job_source_df = add_natural_key(job_source_df, LOCATION_COLUMNS, "_location_key")
 
+job_source_df = (
+    job_source_df
+    .join(
+        companies_lookup_df.select("_company_key", "company_id"),
+        on="_company_key",
+        how="left",
+    )
+    .join(
+        industries_lookup_df.select("_industry_key", "industry_id"),
+        on="_industry_key",
+        how="left",
+    )
+    .join(
+        locations_lookup_df.select("_location_key", "location_id"),
+        on="_location_key",
+        how="left",
+    )
+)
 
+job_postings_df = job_source_df.select(
+    "id",
+    "title_clean",
+    "company_id",
+    "industry_id",
+    "employment_type_name",
+    "remote_type_name",
+    "body",
+    numeric_or_null("min_years_experience").alias("min_years_experience"),
+    numeric_or_null("max_years_experience").alias("max_years_experience"),
+    numeric_or_null("salary").alias("salary"),
+    numeric_or_null("salary_from").alias("salary_from"),
+    numeric_or_null("salary_to").alias("salary_to"),
+    "location_id",
+    "posted",
+    "expired",
+    "duration",
+)
+```
 
+## Register Tables in Spark SQL
 
+```{python}
+#| label: register-tables
+#| warning: false
 
+companies_df.createOrReplaceTempView("companies")
+industries_df.createOrReplaceTempView("industries")
+locations_df.createOrReplaceTempView("locations")
+job_postings_df.createOrReplaceTempView("job_postings")
 
+table_summary = pd.DataFrame(
+    {
+        "table": ["job_postings", "companies", "industries", "locations"],
+        "rows": [
+            job_postings_df.count(),
+            companies_df.count(),
+            industries_df.count(),
+            locations_df.count(),
+        ],
+        "primary_key": ["id", "company_id", "industry_id", "location_id"],
+    }
+)
 
+display(table_summary)
+```
 
+Five-row previews confirm that the generated keys appear first in the three dimension tables. Only identifying columns are previewed from the wide `job_postings` table.
 
+```{python}
+#| label: table-previews
+#| warning: false
 
+display(industries_df.limit(5).toPandas())
+display(companies_df.limit(5).toPandas())
+display(locations_df.limit(5).toPandas())
+display(
+    job_postings_df.select(
+        "id",
+        "title_clean",
+        "company_id",
+        "industry_id",
+        "location_id",
+    )
+    .limit(5)
+    .toPandas()
+)
+```
 
+## Validate Keys and Relationships
 
+The following checks compare every row count with its distinct primary-key count and count null foreign keys in `job_postings`. Equal row and unique-key counts show primary-key uniqueness; zero null foreign keys show that every posting matched its dimensions.
 
+```{python}
+#| label: validate-relations
+#| warning: false
 
+primary_key_check_df = spark.sql(
+    """
+    SELECT 'job_postings' AS table_name,
+           COUNT(*) AS row_count,
+           COUNT(DISTINCT id) AS unique_primary_keys,
+           SUM(CASE WHEN id IS NULL THEN 1 ELSE 0 END) AS null_primary_keys
+    FROM job_postings
+    UNION ALL
+    SELECT 'companies', COUNT(*), COUNT(DISTINCT company_id),
+           SUM(CASE WHEN company_id IS NULL THEN 1 ELSE 0 END)
+    FROM companies
+    UNION ALL
+    SELECT 'industries', COUNT(*), COUNT(DISTINCT industry_id),
+           SUM(CASE WHEN industry_id IS NULL THEN 1 ELSE 0 END)
+    FROM industries
+    UNION ALL
+    SELECT 'locations', COUNT(*), COUNT(DISTINCT location_id),
+           SUM(CASE WHEN location_id IS NULL THEN 1 ELSE 0 END)
+    FROM locations
+    """
+)
 
+foreign_key_check_df = spark.sql(
+    """
+    SELECT COUNT(*) AS job_posting_rows,
+           SUM(CASE WHEN company_id IS NULL THEN 1 ELSE 0 END) AS missing_company_keys,
+           SUM(CASE WHEN industry_id IS NULL THEN 1 ELSE 0 END) AS missing_industry_keys,
+           SUM(CASE WHEN location_id IS NULL THEN 1 ELSE 0 END) AS missing_location_keys
+    FROM job_postings
+    """
+)
 
+display(primary_key_check_df.toPandas())
+display(foreign_key_check_df.toPandas())
+```
 
+## Optional CSV Export
 
+Spark writes a directory of CSV part files rather than one conventional CSV file. The export is optional and remains disabled for the final render.
 
+```{python}
+#| label: optional-industry-export
+#| eval: false
 
+industries_df.write.mode("overwrite").csv(
+    "./output/industries.csv",
+    header=True,
+)
+```
 
+The dataset and optional output directory should be excluded in `.gitignore`:
 
+```text
+data/MET_CareerCompass_2026/
+MET_CareerCompass_2026/
+output/industries.csv/
+research_submissions/
+.env
+```
 
+# Spark SQL Analysis
 
+Each section displays the Spark SQL result first, followed by the required visualization and a short interpretation generated from the actual result.
 
+## Query 1: Technology Salaries by Specialized Occupation
 
+Although the prompt's heading refers to job title, its detailed instructions specify grouping by `specialized_occupation`. This query follows the detailed requirement and filters to NAICS 518210.
 
+```{python}
+#| label: query-1-table
+#| warning: false
 
+query1_df = spark.sql(
+    """
+    SELECT
+        i.naics_2022_6_name AS industry_name,
+        i.specialized_occupation,
+        ROUND(PERCENTILE_APPROX(j.salary, 0.5, 10000), 2) AS median_salary,
+        COUNT(*) AS job_count
+    FROM job_postings AS j
+    INNER JOIN industries AS i
+        ON j.industry_id = i.industry_id
+    WHERE i.naics_2022_6 = '518210'
+      AND j.salary IS NOT NULL
+      AND j.salary > 0
+      AND i.specialized_occupation IS NOT NULL
+      AND TRIM(i.specialized_occupation) <> ''
+    GROUP BY
+        i.naics_2022_6_name,
+        i.specialized_occupation
+    ORDER BY median_salary DESC
+    """
+)
 
+query1_pd = query1_df.toPandas()
+display(query1_pd)
+```
 
+```{python}
+#| label: query-1-chart
+#| warning: false
 
+if query1_pd.empty:
+    display(Markdown("**Visualization note:** No qualifying Query 1 rows were returned."))
+else:
+    query1_figure = px.bar(
+        query1_pd,
+        x="median_salary",
+        y="specialized_occupation",
+        color="industry_name",
+        orientation="h",
+        barmode="group",
+        title="Median Salary in NAICS 518210 by Specialized Occupation",
+        labels={
+            "median_salary": "Median Salary ($)",
+            "specialized_occupation": "Specialized Occupation",
+            "industry_name": "Industry",
+        },
+        height=max(500, 34 * len(query1_pd) + 150),
+    )
+    query1_figure.update_xaxes(tickprefix="$", tickformat=",.0f")
+    query1_figure.update_layout(
+        legend_title_text="Industry",
+        margin=dict(l=20, r=20, t=70, b=20),
+    )
+    query1_figure.update_yaxes(categoryorder="total ascending")
 
+    # A static Plotly image is preferred because it appears in Word output.
+    figures_dir = Path("figures")
+    figures_dir.mkdir(exist_ok=True)
+    query1_image = figures_dir / "query1_median_salary.png"
+    try:
+        query1_figure.write_image(
+            str(query1_image),
+            width=1200,
+            height=max(600, 34 * len(query1_pd) + 180),
+            scale=1.5,
+        )
+        display(Image(filename=str(query1_image)))
+    except Exception:
+        print(
+            "Static Plotly export was unavailable; displaying the interactive chart. "
+            "Install kaleido before the Word render if the chart is missing there."
+        )
+        query1_figure.show()
+```
 
+```{python}
+#| label: query-1-insight
+#| echo: false
 
+if not query1_pd.empty:
+    top_q1 = query1_pd.iloc[0]
+    bottom_q1 = query1_pd.iloc[-1]
+    display(
+        Markdown(
+            "**Insight.** Within NAICS 518210, "
+            f"**{top_q1['specialized_occupation']}** had the highest observed median "
+            f"salary at **${float(top_q1['median_salary']):,.2f}** across "
+            f"**{int(top_q1['job_count']):,}** qualifying postings. The lowest median "
+            f"among the displayed occupation groups was "
+            f"**{bottom_q1['specialized_occupation']}** at "
+            f"**${float(bottom_q1['median_salary']):,.2f}**. These estimates describe "
+            "postings with usable positive salary values and should not be interpreted "
+            "as the salary distribution for postings that omitted compensation."
+        )
+    )
+else:
+    display(
+        Markdown(
+            "**Insight.** No NAICS 518210 postings with a usable positive salary and "
+            "specialized occupation were available in the loaded data."
+        )
+    )
+```
 
+## Query 2: Top Five Companies Offering Remote Jobs in California
 
+```{python}
+#| label: query-2-table
+#| warning: false
 
+query2_df = spark.sql(
+    """
+    SELECT
+        c.company_name,
+        COUNT(*) AS remote_jobs
+    FROM job_postings AS j
+    INNER JOIN companies AS c
+        ON j.company_id = c.company_id
+    INNER JOIN locations AS l
+        ON j.location_id = l.location_id
+    WHERE LOWER(TRIM(j.remote_type_name)) = 'remote'
+      AND LOWER(TRIM(l.state_name)) = 'california'
+      AND c.company_name IS NOT NULL
+      AND TRIM(c.company_name) <> ''
+    GROUP BY c.company_name
+    ORDER BY remote_jobs DESC, c.company_name ASC
+    LIMIT 5
+    """
+)
 
+query2_pd = query2_df.toPandas()
+display(query2_pd)
+```
 
+```{python}
+#| label: query-2-chart
+#| warning: false
 
+if query2_pd.empty:
+    display(Markdown("**Visualization note:** No qualifying Query 2 rows were returned."))
+else:
+    plt.figure(figsize=(10, 6))
+    query2_axis = sns.barplot(
+        data=query2_pd,
+        x="company_name",
+        y="remote_jobs",
+        color="#4C78A8",
+    )
+    query2_axis.set_title("Top Five Companies Offering Remote Jobs in California")
+    query2_axis.set_xlabel("Company Name")
+    query2_axis.set_ylabel("Number of Remote Job Postings")
+    query2_axis.tick_params(axis="x", rotation=35)
+    plt.tight_layout()
+    plt.show()
+```
 
+```{python}
+#| label: query-2-insight
+#| echo: false
 
+if not query2_pd.empty:
+    top_q2 = query2_pd.iloc[0]
+    top_five_total = int(query2_pd["remote_jobs"].sum())
+    top_share = 100 * int(top_q2["remote_jobs"]) / top_five_total
+    display(
+        Markdown(
+            f"**Insight.** **{top_q2['company_name']}** ranked first with "
+            f"**{int(top_q2['remote_jobs']):,}** remote California postings. It "
+            f"accounted for **{top_share:.1f}%** of the postings represented by the "
+            "five companies in this result, showing how concentrated remote hiring was "
+            "among the leading employers."
+        )
+    )
+else:
+    display(Markdown("**Insight.** No remote California postings matched the filters."))
+```
 
+## Query 3: Monthly Job-Posting Trends in California
 
+```{python}
+#| label: query-3-table
+#| warning: false
 
+query3_df = spark.sql(
+    """
+    WITH california_postings AS (
+        SELECT TO_DATE(j.posted, 'yyyy-MM-dd') AS posted_date
+        FROM job_postings AS j
+        INNER JOIN locations AS l
+            ON j.location_id = l.location_id
+        WHERE LOWER(TRIM(l.state_name)) = 'california'
+    )
+    SELECT
+        YEAR(posted_date) AS year,
+        MONTH(posted_date) AS month,
+        COUNT(*) AS job_count
+    FROM california_postings
+    WHERE posted_date IS NOT NULL
+    GROUP BY
+        YEAR(posted_date),
+        MONTH(posted_date)
+    ORDER BY year DESC, month DESC
+    """
+)
 
+query3_pd = query3_df.toPandas()
+display(query3_pd)
+```
 
+```{python}
+#| label: query-3-chart
+#| warning: false
+
+if query3_pd.empty:
+    display(Markdown("**Visualization note:** No qualifying Query 3 rows were returned."))
+else:
+    query3_plot_pd = query3_pd.sort_values(["year", "month"]).copy()
+    query3_plot_pd["year"] = query3_plot_pd["year"].astype(str)
+
+    plt.figure(figsize=(11, 6))
+    query3_axis = sns.lineplot(
+        data=query3_plot_pd,
+        x="month",
+        y="job_count",
+        hue="year",
+        marker="o",
+        linewidth=2,
+    )
+    query3_axis.set_title("Monthly Job-Posting Trends in California")
+    query3_axis.set_xlabel("Month")
+    query3_axis.set_ylabel("Number of Job Postings")
+    query3_axis.set_xticks(range(1, 13))
+    query3_axis.legend(title="Year")
+    plt.tight_layout()
+    plt.show()
+```
+
+```{python}
+#| label: query-3-insight
+#| echo: false
+
+if not query3_pd.empty:
+    peak_q3 = query3_pd.loc[query3_pd["job_count"].idxmax()]
+    low_q3 = query3_pd.loc[query3_pd["job_count"].idxmin()]
+    display(
+        Markdown(
+            f"**Insight.** The highest monthly California volume occurred in "
+            f"**{int(peak_q3['year'])}-{int(peak_q3['month']):02d}**, with "
+            f"**{int(peak_q3['job_count']):,}** postings. The lowest observed month was "
+            f"**{int(low_q3['year'])}-{int(low_q3['month']):02d}**, with "
+            f"**{int(low_q3['job_count']):,}** postings. The line chart makes the "
+            "within-year fluctuations visible while keeping different years separate."
+        )
+    )
+else:
+    display(Markdown("**Insight.** No valid California posting dates matched the filters."))
+```
+
+## Query 4: Salary Comparisons Across Major US Metro Areas
+
+```{python}
+#| label: query-4-table
+#| warning: false
+
+query4_df = spark.sql(
+    """
+    WITH selected_metros AS (
+        SELECT
+            CASE CAST(l.msa AS STRING)
+                WHEN '14460' THEN 'Boston'
+                WHEN '47900' THEN 'Washington DC'
+                WHEN '35620' THEN 'New York'
+                WHEN '41860' THEN 'San Francisco'
+                WHEN '42660' THEN 'Seattle'
+                WHEN '31080' THEN 'Los Angeles'
+                WHEN '19100' THEN 'Dallas'
+                WHEN '26420' THEN 'Houston'
+                WHEN '12420' THEN 'Austin'
+                WHEN '34980' THEN 'Nashville'
+                WHEN '28140' THEN 'Kansas City'
+                WHEN '19740' THEN 'Denver'
+            END AS metro_area,
+            j.salary
+        FROM job_postings AS j
+        INNER JOIN locations AS l
+            ON j.location_id = l.location_id
+        WHERE j.salary IS NOT NULL
+          AND j.salary > 0
+          AND CAST(l.msa AS STRING) IN (
+              '14460', '47900', '35620', '41860',
+              '42660', '31080', '19100', '26420',
+              '12420', '34980', '28140', '19740'
+          )
+    )
+    SELECT
+        metro_area,
+        ROUND(AVG(salary), 2) AS average_salary,
+        COUNT(*) AS job_postings
+    FROM selected_metros
+    WHERE metro_area IS NOT NULL
+    GROUP BY metro_area
+    ORDER BY average_salary DESC
+    """
+)
+
+query4_pd = query4_df.toPandas()
+display(query4_pd)
+```
+
+```{python}
+#| label: query-4-chart
+#| warning: false
+
+if query4_pd.empty:
+    display(Markdown("**Visualization note:** No qualifying Query 4 rows were returned."))
+else:
+    plt.figure(figsize=(11, 7))
+    query4_axis = sns.barplot(
+        data=query4_pd,
+        x="average_salary",
+        y="metro_area",
+        order=query4_pd["metro_area"].tolist(),
+        color="#4C78A8",
+    )
+    query4_axis.set_title("Average Salary Across Selected US Metro Areas")
+    query4_axis.set_xlabel("Average Salary ($)")
+    query4_axis.set_ylabel("Metro Area")
+    query4_axis.xaxis.set_major_formatter(StrMethodFormatter("${x:,.0f}"))
+    plt.tight_layout()
+    plt.show()
+```
+
+```{python}
+#| label: query-4-insight
+#| echo: false
+
+if not query4_pd.empty:
+    top_q4 = query4_pd.iloc[0]
+    bottom_q4 = query4_pd.iloc[-1]
+    salary_gap = float(top_q4["average_salary"]) - float(bottom_q4["average_salary"])
+    display(
+        Markdown(
+            f"**Insight.** **{top_q4['metro_area']}** had the highest average listed "
+            f"salary at **${float(top_q4['average_salary']):,.2f}**, based on "
+            f"**{int(top_q4['job_postings']):,}** qualifying postings. "
+            f"**{bottom_q4['metro_area']}** had the lowest average among the selected "
+            f"metros at **${float(bottom_q4['average_salary']):,.2f}**, a difference "
+            f"of **${salary_gap:,.2f}**. Posting counts should be considered alongside "
+            "the averages because metros with fewer disclosed salaries may have less "
+            "stable estimates."
+        )
+    )
+else:
+    display(Markdown("**Insight.** No selected metro postings had usable positive salaries."))
+```
+
+# Conclusion
+
+This workflow converts the wide job-postings source into a relational Spark SQL model and validates the primary-key and foreign-key relationships before analysis. The four queries then describe compensation within the technology sector, concentration in remote California hiring, changes in California posting activity over time, and geographic salary differences. All findings are limited to the job postings represented in the dataset, and salary findings are further limited to records with usable positive salary values.
+
+# Final Submission Checklist
+
+- Replace the GitHub URL placeholder near the beginning of this report.
+- Confirm that `USE_SAMPLE = False` and that all 17 Parquet files are found.
+- Run all cells from top to bottom on the EC2 instance.
+- Complete the generated research-survey workbook and enable its validation cell.
+- Confirm that all four query tables, four charts, and four insights appear.
+- Render the document with `quarto render M02-A-jzhu116.qmd --to docx`.
+- Optionally render HTML with `quarto render M02-A-jzhu116.qmd --to html`.
+- Commit the QMD, rendered Word document, and any required supporting files.
+- Keep `.env`, Parquet files, optional CSV output, and research submissions out of GitHub.

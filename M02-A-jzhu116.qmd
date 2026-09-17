@@ -23,7 +23,7 @@ execute:
 
 # Submission Information
 
-**GitHub repository:** REPLACE_WITH_YOUR_HTTPS_GITHUB_REPOSITORY_URL
+**GitHub repository:** https://github.com/jz116/assignment-02
 
 This report uses Apache Spark to transform the MET Employability Career Match job-postings dataset into four related tables. It then uses Spark SQL to examine technology-sector salaries, remote hiring in California, monthly posting trends, and salary differences across selected metropolitan areas. Query results are shown in tables before their required visualizations.
 
